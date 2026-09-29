@@ -1,0 +1,22 @@
+[project]
+name = "vpc-provisioning-api"
+version = "1.0.0"
+description = "Authenticated, asynchronous AWS API that provisions VPCs with multiple subnets."
+requires-python = ">=3.11"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+src = ["src", "scripts"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "C4", "SIM"]
+ignore = [
+    # Long docstring/comment lines are common in this codebase.
+    "E501",
+    # Status deliberately subclasses (str, Enum) rather than enum.StrEnum: the
+    # mixin keeps `Status.PENDING == "PENDING"` for DynamoDB and JSON while still
+    # giving a closed set of values.  StrEnum would also change f-string
+    # formatting behaviour, which is not worth it here.
+    "UP042",
+]

@@ -1,0 +1,5 @@
+# Runtime dependencies for the Lambda functions.
+#
+# boto3 / botocore are already provided by the AWS Lambda Python runtime, so
+# there is nothing to bundle.  Keep this file present (and empty of pins) so
+# `sam build` has a predictable place to look if a dependency is ever added.

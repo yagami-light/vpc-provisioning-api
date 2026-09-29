@@ -1,0 +1,12 @@
+# Tooling for working on this project locally.
+#
+# Nothing here is needed at runtime: boto3 and botocore ship with the Lambda
+# Python runtime, so src/requirements.txt stays empty.
+boto3>=1.34
+ruff>=0.6
+
+# botocore's `crt` extra is only needed if you authenticate with `aws login`
+# (as opposed to static keys or SSO).  Without it, boto3 raises
+# MissingDependencyException when it tries to read the login session.
+# See the "Credentials" note in README section 5.
+botocore[crt]

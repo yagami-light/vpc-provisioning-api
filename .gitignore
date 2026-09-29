@@ -1,0 +1,30 @@
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+.python-version
+
+# ---- Tooling caches ----
+.ruff_cache/
+.mypy_cache/
+.tox/
+.coverage
+coverage.xml
+
+# ---- macOS ----
+.DS_Store
+
+# ---- AWS SAM ----
+.aws-sam/
+samconfig.local.toml
+packaged.yaml
+
+# ---- Local secrets / scratch ----
+.env
+*.local.json
+token.txt

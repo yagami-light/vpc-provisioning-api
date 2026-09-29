@@ -1,0 +1,30 @@
+# SAM CLI configuration.
+#
+# `sam deploy` with no arguments reads this file, so deploying is a single
+# non-interactive command.  Anything here can be overridden on the command line,
+# for example:
+#
+#   sam deploy --parameter-overrides ProjectName=my-api
+#   sam deploy --region us-east-1
+version = 0.1
+
+[default.global.parameters]
+stack_name = "vpc-provisioning-api"
+region = "eu-west-1"
+
+[default.build.parameters]
+cached = true
+parallel = true
+
+[default.deploy.parameters]
+# The stack creates IAM roles, so this capability is required.
+capabilities = "CAPABILITY_IAM"
+confirm_changeset = false
+resolve_s3 = true
+fail_on_empty_changeset = false
+# Mirrors the template defaults; change these here rather than editing the stack
+# by hand.  ProjectName is also the ManagedBy ownership tag.
+parameter_overrides = "ProjectName=vpc-provisioning-api MaxSubnetsPerRequest=16 MaxAttempts=3 ProvisionerConcurrency=5 LogRetentionDays=30 LogLevel=INFO"
+
+[default.validate.parameters]
+lint = true

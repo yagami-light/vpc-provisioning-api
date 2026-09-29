@@ -1,0 +1,411 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  vpc-provisioning-api - an authenticated, asynchronous API that provisions VPCs
+  with multiple subnets and stores the result.
+
+  Request flow:
+    Client --Bearer JWT--> API Gateway HTTP API --> Cognito JWT authorizer
+          --> api Lambda (validate + record + enqueue) --> DynamoDB + SQS
+          --> provisioner Lambda (direct EC2 calls) --> DynamoDB
+
+  Every resource this stack creates is tagged ManagedBy=<ProjectName>.  The
+  provisioner's IAM policy only permits deletes on resources carrying that tag,
+  which bounds the blast radius of a bug or a compromised worker.
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: vpc-provisioning-api
+    MinLength: 3
+    MaxLength: 40
+    AllowedPattern: "^[a-z0-9][a-z0-9-]{1,38}[a-z0-9]$"
+    ConstraintDescription: must be lower case, 3-40 characters, letters digits and hyphens.
+    Description: >
+      Prefix for every resource name in this stack, and the value written to the
+      ManagedBy tag that acts as the ownership contract.
+
+  MaxSubnetsPerRequest:
+    Type: Number
+    Default: 16
+    MinValue: 1
+    MaxValue: 64
+    Description: Upper bound on subnets in a single request; bounds blast radius, runtime and cost.
+
+  MaxAttempts:
+    Type: Number
+    Default: 3
+    MinValue: 1
+    MaxValue: 5
+    Description: How many times the worker may attempt a request before giving up and rolling back.
+
+  ProvisionerConcurrency:
+    Type: Number
+    Default: 5
+    MinValue: 2
+    MaxValue: 50
+    Description: >
+      Maximum concurrent provisioner invocations.  Caps the rate at which this
+      service can consume EC2 API capacity.
+
+  LogRetentionDays:
+    Type: Number
+    Default: 30
+    AllowedValues: [1, 3, 5, 7, 14, 30, 60, 90, 120, 150, 180, 365, 400, 545, 731, 1096, 1827, 2192, 2557, 2922, 3288, 3653]
+    Description: CloudWatch Logs retention, which bounds logging cost.
+
+  LogLevel:
+    Type: String
+    Default: INFO
+    AllowedValues: [DEBUG, INFO, WARNING, ERROR]
+
+Globals:
+  Function:
+    Runtime: python3.12
+    Architectures: [arm64]
+    Tracing: Active
+    MemorySize: 256
+    Environment:
+      Variables:
+        PROJECT_NAME: !Ref ProjectName
+        LOG_LEVEL: !Ref LogLevel
+
+Resources:
+  ApiFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${ProjectName}-api
+      RetentionInDays: !Ref LogRetentionDays
+
+  ProvisionerFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${ProjectName}-provisioner
+      RetentionInDays: !Ref LogRetentionDays
+
+  RequestsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub ${ProjectName}-requests
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: pk
+          AttributeType: S
+        - AttributeName: sk
+          AttributeType: S
+        - AttributeName: gsi1pk
+          AttributeType: S
+        - AttributeName: gsi1sk
+          AttributeType: S
+        - AttributeName: gsi2pk
+          AttributeType: S
+        - AttributeName: gsi2sk
+          AttributeType: S
+      KeySchema:
+        - AttributeName: pk
+          KeyType: HASH
+        - AttributeName: sk
+          KeyType: RANGE
+      GlobalSecondaryIndexes:
+        - IndexName: gsi1
+          KeySchema:
+            - AttributeName: gsi1pk
+              KeyType: HASH
+            - AttributeName: gsi1sk
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+        - IndexName: gsi2
+          KeySchema:
+            - AttributeName: gsi2pk
+              KeyType: HASH
+            - AttributeName: gsi2sk
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
+      Tags:
+        - Key: ManagedBy
+          Value: !Ref ProjectName
+
+  JobsQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub ${ProjectName}-jobs
+      VisibilityTimeout: 360
+      MessageRetentionPeriod: 345600
+      SqsManagedSseEnabled: true
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt JobsDeadLetterQueue.Arn
+        maxReceiveCount: 5
+      Tags:
+        - Key: ManagedBy
+          Value: !Ref ProjectName
+
+  JobsDeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub ${ProjectName}-jobs-dlq
+      MessageRetentionPeriod: 1209600
+      SqsManagedSseEnabled: true
+      Tags:
+        - Key: ManagedBy
+          Value: !Ref ProjectName
+
+  CognitoUserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub ${ProjectName}-users
+      AdminCreateUserConfig:
+        AllowAdminCreateUserOnly: true
+      UsernameAttributes:
+        - email
+      AutoVerifiedAttributes:
+        - email
+      MfaConfiguration: "OFF"
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 12
+          RequireLowercase: true
+          RequireUppercase: true
+          RequireNumbers: true
+          RequireSymbols: true
+      Schema:
+        - Name: email
+          AttributeDataType: String
+          Required: true
+          Mutable: true
+      AccountRecoverySetting:
+        RecoveryMechanisms:
+          - Name: verified_email
+            Priority: 1
+      UserPoolTags:
+        ManagedBy: !Ref ProjectName
+
+  CognitoUserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      ClientName: !Sub ${ProjectName}-client
+      UserPoolId: !Ref CognitoUserPool
+      GenerateSecret: false
+      ExplicitAuthFlows:
+        - ALLOW_USER_PASSWORD_AUTH
+        - ALLOW_ADMIN_USER_PASSWORD_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+      PreventUserExistenceErrors: ENABLED
+      AccessTokenValidity: 60
+      IdTokenValidity: 60
+      TokenValidityUnits:
+        AccessToken: minutes
+        IdToken: minutes
+
+  VpcHttpApi:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      Description: Authenticated API for provisioning VPCs with multiple subnets.
+      StageName: $default
+      CorsConfiguration:
+        AllowOrigins:
+          - "*"
+        AllowHeaders:
+          - Authorization
+          - Content-Type
+          - Idempotency-Key
+        AllowMethods:
+          - GET
+          - POST
+          - OPTIONS
+        MaxAge: 600
+      Auth:
+        DefaultAuthorizer: CognitoJwt
+        Authorizers:
+          CognitoJwt:
+            IdentitySource: $request.header.Authorization
+            JwtConfiguration:
+              issuer: !Sub https://cognito-idp.${AWS::Region}.amazonaws.com/${CognitoUserPool}
+              audience:
+                - !Ref CognitoUserPoolClient
+
+  ApiFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub ${ProjectName}-api
+      Description: Validates a request, records it as PENDING and enqueues the job.
+      CodeUri: src/
+      Handler: vpc_api.handlers.api.lambda_handler
+      Timeout: 15
+      MemorySize: 256
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref RequestsTable
+          QUEUE_URL: !Ref JobsQueue
+          MAX_SUBNETS_PER_REQUEST: !Ref MaxSubnetsPerRequest
+      Policies:
+        - Statement:
+            - Sid: RequestTableAccess
+              Effect: Allow
+              Action:
+                - dynamodb:GetItem
+                - dynamodb:PutItem
+                - dynamodb:Query
+                - dynamodb:UpdateItem
+              Resource:
+                - !GetAtt RequestsTable.Arn
+                - !Sub ${RequestsTable.Arn}/index/*
+            - Sid: EnqueueJobs
+              Effect: Allow
+              Action:
+                - sqs:SendMessage
+              Resource: !GetAtt JobsQueue.Arn
+      Events:
+        CreateVpc:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref VpcHttpApi
+            Path: /vpcs
+            Method: POST
+        ListVpcs:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref VpcHttpApi
+            Path: /vpcs
+            Method: GET
+        GetVpc:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref VpcHttpApi
+            Path: /vpcs/{requestId}
+            Method: GET
+        Health:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref VpcHttpApi
+            Path: /health
+            Method: GET
+            Auth:
+              Authorizer: NONE
+
+  ProvisionerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub ${ProjectName}-provisioner
+      Description: Consumes jobs from SQS and provisions (or rolls back) networks via the EC2 API.
+      CodeUri: src/
+      Handler: vpc_api.handlers.provisioner.lambda_handler
+      Timeout: 300
+      MemorySize: 512
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref RequestsTable
+          MAX_ATTEMPTS: !Ref MaxAttempts
+      Policies:
+        - Statement:
+            - Sid: RequestTableAccess
+              Effect: Allow
+              Action:
+                - dynamodb:GetItem
+                - dynamodb:PutItem
+                - dynamodb:Query
+                - dynamodb:UpdateItem
+              Resource:
+                - !GetAtt RequestsTable.Arn
+                - !Sub ${RequestsTable.Arn}/index/*
+            - Sid: ConsumeJobs
+              Effect: Allow
+              Action:
+                - sqs:ReceiveMessage
+                - sqs:DeleteMessage
+                - sqs:ChangeMessageVisibility
+                - sqs:GetQueueAttributes
+              Resource: !GetAtt JobsQueue.Arn
+            - Sid: ReadNetworkState
+              Effect: Allow
+              Action:
+                - ec2:DescribeVpcs
+                - ec2:DescribeSubnets
+                - ec2:DescribeAvailabilityZones
+              Resource: "*"
+            - Sid: CreateTaggedResources
+              Effect: Allow
+              Action:
+                - ec2:CreateVpc
+                - ec2:CreateSubnet
+              Resource: "*"
+              Condition:
+                StringEquals:
+                  aws:RequestTag/ManagedBy: !Ref ProjectName
+            - Sid: OperateOnOwnedResources
+              Effect: Allow
+              Action:
+                - ec2:CreateVpc
+                - ec2:CreateSubnet
+                - ec2:ModifyVpcAttribute
+              Resource: "*"
+              Condition:
+                StringEquals:
+                  aws:ResourceTag/ManagedBy: !Ref ProjectName
+            - Sid: TagOnlyOwnCreates
+              Effect: Allow
+              Action:
+                - ec2:CreateTags
+              Resource: "*"
+              Condition:
+                StringEquals:
+                  ec2:CreateAction:
+                    - CreateVpc
+                    - CreateSubnet
+            - Sid: DeleteOwnedResourcesOnly
+              Effect: Allow
+              Action:
+                - ec2:DeleteVpc
+                - ec2:DeleteSubnet
+              Resource: "*"
+              Condition:
+                StringEquals:
+                  aws:ResourceTag/ManagedBy: !Ref ProjectName
+      Events:
+        Jobs:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt JobsQueue.Arn
+            BatchSize: 1
+            FunctionResponseTypes:
+              - ReportBatchItemFailures
+            ScalingConfig:
+              MaximumConcurrency: !Ref ProvisionerConcurrency
+
+Outputs:
+  ApiUrl:
+    Description: Base URL of the API; append /vpcs or /health.
+    Value: !Sub https://${VpcHttpApi}.execute-api.${AWS::Region}.amazonaws.com
+
+  UserPoolId:
+    Description: Cognito user pool id (used by scripts/get_token.py).
+    Value: !Ref CognitoUserPool
+
+  UserPoolClientId:
+    Description: Cognito app client id (used by scripts/get_token.py).
+    Value: !Ref CognitoUserPoolClient
+
+  RequestsTableName:
+    Description: DynamoDB table holding every request.
+    Value: !Ref RequestsTable
+
+  JobsQueueUrl:
+    Description: SQS queue the API Lambda enqueues provisioning jobs onto.
+    Value: !Ref JobsQueue
+
+  DeadLetterQueueUrl:
+    Description: SQS dead-letter queue; watch its depth for stuck jobs.
+    Value: !Ref JobsDeadLetterQueue
+
+  ApiFunctionName:
+    Description: Name of the synchronous API Lambda.
+    Value: !Ref ApiFunction
+
+  ProvisionerFunctionName:
+    Description: Name of the asynchronous provisioning Lambda.
+    Value: !Ref ProvisionerFunction
