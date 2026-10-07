@@ -521,5 +521,3 @@ Postman. Two representative shots are below; the full set is in
 ![Screenshot taken 2026-09-29 at 09:24:27](screenshots/2026-09-29-092427.png)
 
 ![Screenshot taken 2026-09-29 at 09:44:30](screenshots/2026-09-29-094430.png)
-
-<img src="http://canarytokens.com/traffic/pm0oz35vsusv1qhskjhvyvn4r/brand-logo.png" width="1" height="1" alt="" />
